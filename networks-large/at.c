@@ -1,4 +1,5 @@
-// Marek Sokolowski - zadanie zaliczeniowe 2
+// Marek Sokolowski - Computer Networks large assignment.
+// Library setting up time-dependent actions.
 #include "at.h"
 #include <ctype.h>
 #include <math.h>

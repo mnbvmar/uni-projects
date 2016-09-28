@@ -1,5 +1,5 @@
-// Marek Sokolowski - zadanie zaliczeniowe 2
-// Biblioteka obslugujaca uplyw czasu
+// Marek Sokolowski - Computer Networks large assignment.
+// Library setting up time-dependent actions.
 #ifndef __AT
 #define __AT
 #include <signal.h>
