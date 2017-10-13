@@ -1,0 +1,9 @@
+data Pair [a] = Pair [a, a];
+
+# Musi być typu Pair(t -> t) -> t -> t.
+compose p = case p {
+  Pair [f g] -> fun x -> f (g x)
+};
+
+main = let a = Pair (fun x -> x * 2) (fun x -> x + 3)
+       in if (compose a) 10 then 5 else 6;

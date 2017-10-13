@@ -1,0 +1,4 @@
+def same :: a -> a -> a;
+same a b = a;
+
+main = same (fun x y -> x y) (fun x y -> x + y);

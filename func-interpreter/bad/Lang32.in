@@ -1,0 +1,7 @@
+def makeSame :: a -> a -> a;
+makeSame f g = f;
+
+
+sameCompose f g = let ff = makeSame f g in fun x -> f (g x);
+
+main = if (sameCompose (fun x -> x * 2) (fun x -> x + 1)) 10 then 2 else 3;

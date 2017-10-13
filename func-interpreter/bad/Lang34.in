@@ -1,0 +1,10 @@
+data Pair [a] = Pair [a, a];
+data Two [] = T1 [] | T2 [];
+
+doSomething x = case x {
+    Pair [(T1 []) (T1 [])] -> 0
+  | Pair [(T2 []) (T2 [])] -> 1
+  | Pair [(T1 []) (T2 [])] -> 2
+};
+
+main = doSomething (Pair T1 T1);

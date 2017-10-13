@@ -1,0 +1,4 @@
+def badCmp :: Int -> Int -> Int; # Should be -> Bool
+badCmp a b = a >= b;
+
+main = badCmp 1 2;

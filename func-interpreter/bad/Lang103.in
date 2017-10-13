@@ -1,0 +1,10 @@
+data Tree [a a] = Leaf[] | Node[Tree a a, a, Tree a a];
+
+# def leftmost
+leftmost tree = case tree {
+    Node [Leaf[] val _] -> val
+  | Node [lft _ _] -> leftmost lft
+};
+
+
+main = leftmost (Node Leaf 5 Leaf);

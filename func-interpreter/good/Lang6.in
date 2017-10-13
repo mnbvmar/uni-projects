@@ -1,0 +1,9 @@
+data Tree [] = Leaf[] | Node[Tree, Tree, Int];
+
+def getSum :: Tree -> Int;
+getSum tree = case tree {
+    Leaf [] -> 0
+  | Node [lft rgt val] -> (val + (getSum lft) + (getSum rgt))
+};
+
+main = getSum (Node (Node Leaf Leaf 1) (Node Leaf (Node Leaf Leaf 4) 2) 3);

@@ -1,0 +1,6 @@
+isNothing x = case x {
+    Just [_] -> 0
+  | Nothing [] -> 1
+};
+
+main = isNothing (doMaybe (fun x -> Just (x + 5)) Nothing);

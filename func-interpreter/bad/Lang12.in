@@ -1,0 +1,6 @@
+meh x = case x {
+    Nic [] -> 0
+  | Ple [] -> 1
+};
+
+int main = meh Nic;

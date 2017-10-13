@@ -1,0 +1,5 @@
+
+
+apply f g = fun x -> f (g x);
+
+main = length (apply (fun x -> []) (fun x -> x) 10);

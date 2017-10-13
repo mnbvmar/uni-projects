@@ -1,0 +1,17 @@
+data Lt [a] = A[] | B[a, Tree a, Lt a];
+data Tree [a] = Empty[] | Node[a, Lt (Tree a)];
+
+
+myFoldl func start lst = case lst {
+    A [] -> start
+  | B [x _ xs] -> myFoldl func (func start x) xs
+};
+
+
+sumElems t = case t {
+    Empty [] -> 0
+  | Node [t l] -> myFoldl (fun x y -> x + (sumElems y)) t l
+};
+
+
+main = (sumElems (Node 1 (B (Node 5 A) Empty (B (Node 5 A) Empty A))));

@@ -1,0 +1,4 @@
+def hello :: Int -> Int;
+
+def main :: Int;
+main = 42;

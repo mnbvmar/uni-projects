@@ -1,0 +1,3 @@
+data Ple [a] = Nic [] | Cos [a, Ple (Ple a)];
+
+main = 10;

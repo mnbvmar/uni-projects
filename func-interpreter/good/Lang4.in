@@ -1,0 +1,2 @@
+data Color [] = Red [] | Green [] | Blue [] | IdColor [Int];
+main = let a = IdColor 15 in 5;

@@ -1,0 +1,90 @@
+Prog.    Prog ::= [Def];
+
+DefCons. Def ::= "data" IdentCons "[" [IdentVar] "]" "=" [ConsType];
+DefType. Def ::= "def" IdentVar "::" Type;
+DefDecl. Def ::= Decl;
+
+terminator Def ";";
+
+Cons.    ConsType ::= IdentCons "[" [Type] "]";
+
+separator ConsType "|";
+separator Type ",";
+
+
+Decl.    Decl ::= IdentVar [IdentVar] "=" Exp;
+
+terminator Decl ";";
+separator IdentVar "";
+
+
+
+BindAny.  Binding ::= "_";
+BindVar.  Binding ::= IdentVar;
+BindCons. Binding ::= IdentCons "[" [Binding] "]";
+
+separator Binding "";
+
+coercions Binding 1;
+
+
+ELam.   Exp1 ::= "fun" [IdentVar] "->" Exp;
+ELet.   Exp1 ::= "let" Decl "in" Exp;
+EIf.    Exp1 ::= "if" Exp "then" Exp "else" Exp;
+ECase.  Exp1 ::= "case" Exp "{" [BindCase] "}";
+EOp.    Exp2 ::= Exp3 Op1 Exp2;
+EOp.    Exp3 ::= Exp3 Op2 Exp4;
+EOp.    Exp4 ::= Exp4 Op3 Exp5;
+EOp.    Exp5 ::= Exp5 Op4 Exp6;
+EApp.   Exp6 ::= Exp6 Exp7;
+ECons.  Exp7 ::= IdentCons;
+EVar.   Exp7 ::= IdentVar;
+EInt.   Exp7 ::= Integer;
+EList.  Exp7 ::= ConstList;
+
+coercions Exp 7;
+
+
+Bind.   BindCase ::= Binding "->" Exp;
+
+separator BindCase "|";
+
+
+Op1.    Op  ::= Op1;
+Op2.    Op  ::= Op2;
+Op3.    Op  ::= Op3;
+Op4.    Op  ::= Op4;
+
+
+OpLst.  Op4 ::= ":";
+
+OpMul.  Op3 ::= "*";
+OpDiv.  Op3 ::= "/";
+
+OpAdd.  Op2 ::= "+";
+OpSub.  Op2 ::= "-";
+
+OpLeq.  Op1 ::= "<=";
+OpLt.   Op1 ::= "<";
+OpGeq.  Op1 ::= ">=";
+OpGt.   Op1 ::= ">";
+OpEq.   Op1 ::= "==";
+OpNeq.  Op1 ::= "!=";
+
+
+ConstList. ConstList ::= "[" [Exp] "]";
+separator Exp ",";
+
+
+TCons.  Type2 ::= IdentCons;
+TVar.   Type2 ::= IdentVar;
+TApp.   Type1 ::= Type1 Type2;
+TFun.   Type  ::= Type1 "->" Type;
+
+coercions Type 2;
+
+
+token IdentVar  (lower (letter | digit | '_')*);
+token IdentCons (upper (letter | digit | '_')*);
+
+comment "#";

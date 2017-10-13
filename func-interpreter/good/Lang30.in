@@ -1,0 +1,5 @@
+
+
+main = case (fun x -> x) {
+  _ -> 1
+};

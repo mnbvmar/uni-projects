@@ -1,0 +1,4 @@
+def applyFuncs :: a -> List (a -> a) -> a;
+applyFuncs elem funcs = foldl (fun x f -> f x) elem funcs;
+
+main = applyFuncs 5 [(fun x -> x + 5), (fun x -> x * 2), (fun x -> x / 5)];

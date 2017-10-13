@@ -1,0 +1,8 @@
+
+even x a b = if x == 0 then a else odd (x - 1) b a;
+odd x a b = if x == 0 then b else if x == 1 then a else even (x - 1) b a;
+
+main = if even 7 (0 == 0) (0 == 1)
+       then even 1 2 3
+       else even 2 3 4;
+

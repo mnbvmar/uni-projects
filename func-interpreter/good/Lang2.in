@@ -1,0 +1,6 @@
+def partFactorial :: Int -> Int -> Int;
+partFactorial a b = if a > b then 1
+                    else b * partFactorial a (b - 1);
+
+main = let f = partFactorial 2
+       in f (f 3);

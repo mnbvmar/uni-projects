@@ -1,0 +1,1 @@
+main = (length (Elem 5 (Elem 7 Nil))) * (length [1, 2, 3, 4, 5]);

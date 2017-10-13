@@ -1,0 +1,8 @@
+data EitherX [a b] = LeftX [a] | RightX [b];
+
+getValue e = case e {
+    LeftX [x] -> x
+  | RightX [y] -> y
+};
+
+main = let x = RightX 7 in getValue x;

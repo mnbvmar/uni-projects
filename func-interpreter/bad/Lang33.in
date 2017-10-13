@@ -1,0 +1,9 @@
+
+def firstTwoSame :: List t -> Bool;
+firstTwoSame x = case x {
+    Elem [x (Elem [x _])] -> (1 == 1)
+ |  _ -> (1 == 0)
+};
+
+
+main = firstTwoSame [1, 1, 2, 2, 3, 3];

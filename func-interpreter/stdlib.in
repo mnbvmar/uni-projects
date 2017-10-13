@@ -1,0 +1,83 @@
+# A declaration of 'undefined' to simplify typing. Inside the interpreter,
+# an error is issued when 'undefined' is evaluated.
+def undefined :: a;
+undefined = undefined;
+
+
+data List [a] = Nil [] | Elem [a, List a];
+
+def length :: List a -> Int;
+length lst = case lst {
+    Nil [] -> 0
+  | Elem [_ tail] -> 1 + length tail
+};
+
+def empty :: List a -> Bool;
+empty lst = case lst {
+    Nil [] -> (0 == 1)
+  | Elem [_ _] -> (1 == 1)
+};
+
+def head :: List a -> a;
+head lst = case lst {
+    Nil [] -> undefined
+  | Elem [x xs] -> x
+};
+
+def tail :: List a -> List a;
+tail lst = case lst {
+    Nil [] -> undefined
+  | Elem [x xs] -> xs
+};
+
+def elem :: List a -> Int -> a;
+elem lst id = case lst {
+    Nil [] -> undefined
+  | Elem [x xs] -> if id == 0 then x else elem xs (id - 1)
+};
+              
+
+def map :: (a -> b) -> List a -> List b;
+map func lst = case lst {
+    Nil [] -> Nil
+  | Elem [x xs] -> Elem (func x) (map func xs)
+};
+
+def filter :: (a -> Bool) -> List a -> List a;
+filter pred lst = case lst {
+    Nil [] -> Nil
+  | Elem [x xs] -> if pred x then Elem x (filter pred xs)
+                             else filter pred xs
+};
+
+def foldl :: (b -> a -> b) -> b -> List a -> b;
+foldl func start lst = case lst {
+    Nil [] -> start
+  | Elem [x xs] -> foldl func (func start x) xs
+};
+
+def foldr :: (a -> b -> b) -> b -> List a -> b;
+foldr func start lst = case lst {
+    Nil [] -> start
+  | Elem [x xs] -> func x (foldr func start xs)
+};
+
+
+
+data Maybe [a] = Nothing [] | Just [a];
+
+def doMaybe :: (a -> Maybe b) -> Maybe a -> Maybe b;
+doMaybe func x = case x {
+    Nothing [] -> Nothing
+  | Just [elem] -> func elem
+};
+
+
+
+data Either [a b] = Left [a] | Right [b];
+
+def doEither :: (t -> Either a b) -> Either a t -> Either a b;
+doEither func x = case x {
+    Left [elem] -> Left elem
+  | Right [elem] -> func elem
+};

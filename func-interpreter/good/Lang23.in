@@ -1,0 +1,9 @@
+
+def twoFirst :: List Int -> Int;
+twoFirst l = case l {
+    Elem [a Elem [b _]] -> a + b
+  | _ -> undefined
+};
+
+
+main = twoFirst [1,2,5,8,10];

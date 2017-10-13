@@ -1,0 +1,12 @@
+data Color [] = Red[] | Green[] | Blue[] | IdColor[Int];
+
+def getColor :: Color -> Int;
+getColor col = case col {
+    Red [] -> 0
+  | Green [] -> 1
+  | Blue [] -> 2
+  | IdColor [n] -> n
+};
+
+# Zwraca 0.
+main = getColor (IdColor 10);
