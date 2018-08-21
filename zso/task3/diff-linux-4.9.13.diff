@@ -1,0 +1,1538 @@
+diff -uprN a/fs/file.c b/fs/file.c
+--- a/fs/file.c	2018-06-09 12:25:52.530491957 -0700
++++ b/fs/file.c	2018-06-10 11:31:33.000000000 -0700
+@@ -563,6 +563,11 @@ int get_unused_fd_flags(unsigned flags)
+ }
+ EXPORT_SYMBOL(get_unused_fd_flags);
+ 
++int get_unused_fd_flags_ctx(unsigned flags, struct task_struct *ctx)
++{
++	return __alloc_fd(ctx->files, 0, rlimit(RLIMIT_NOFILE), flags);
++}
++
+ static void __put_unused_fd(struct files_struct *files, unsigned int fd)
+ {
+ 	struct fdtable *fdt = files_fdtable(files);
+@@ -629,6 +634,11 @@ void fd_install(unsigned int fd, struct
+ 
+ EXPORT_SYMBOL(fd_install);
+ 
++void fd_install_ctx(unsigned int fd, struct file *file, struct task_struct *ctx)
++{
++	__fd_install(ctx->files, fd, file);
++}
++
+ /*
+  * The same warnings as for __alloc_fd()/__fd_install() apply here...
+  */
+@@ -691,9 +701,9 @@ void do_close_on_exec(struct files_struc
+ 	spin_unlock(&files->file_lock);
+ }
+ 
+-static struct file *__fget(unsigned int fd, fmode_t mask)
+-{
+-	struct files_struct *files = current->files;
++static struct file *__fget_ctx(unsigned int fd, fmode_t mask,
++				struct task_struct *ctx) {
++	struct files_struct *files = ctx->files;
+ 	struct file *file;
+ 
+ 	rcu_read_lock();
+@@ -714,18 +724,31 @@ loop:
+ 	return file;
+ }
+ 
++static struct file *__fget(unsigned int fd, fmode_t mask)
++{
++	return __fget_ctx(fd, mask, current);
++}
++
+ struct file *fget(unsigned int fd)
+ {
+ 	return __fget(fd, FMODE_PATH);
+ }
+ EXPORT_SYMBOL(fget);
+ 
++struct file *fget_ctx(unsigned int fd, struct task_struct *ctx) {
++	return __fget_ctx(fd, FMODE_PATH, ctx);
++}
++
+ struct file *fget_raw(unsigned int fd)
+ {
+ 	return __fget(fd, 0);
+ }
+ EXPORT_SYMBOL(fget_raw);
+ 
++struct file *fget_raw_ctx(unsigned int fd, struct task_struct *ctx) {
++	return __fget_ctx(fd, 0, ctx);
++}
++
+ /*
+  * Lightweight file lookup - no refcnt increment if fd table isn't shared.
+  *
+@@ -886,23 +909,27 @@ out_unlock:
+ 	return err;
+ }
+ 
+-SYSCALL_DEFINE3(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
++int dup3_to_ctx(unsigned int oldfd, unsigned int newfd, int flags,
++	struct task_struct *ctx)
+ {
+ 	int err = -EBADF;
+ 	struct file *file;
+-	struct files_struct *files = current->files;
++	struct files_struct *src_files = current->files;
++	struct files_struct *dst_files = ctx->files;
+ 
+ 	if ((flags & ~O_CLOEXEC) != 0)
+ 		return -EINVAL;
+ 
+-	if (unlikely(oldfd == newfd))
++	if (unlikely(oldfd == newfd && src_files == dst_files))
+ 		return -EINVAL;
+ 
+-	if (newfd >= rlimit(RLIMIT_NOFILE))
++	if (newfd >= task_rlimit(ctx, RLIMIT_NOFILE))
+ 		return -EBADF;
+ 
+-	spin_lock(&files->file_lock);
+-	err = expand_files(files, newfd);
++	spin_lock(&dst_files->file_lock);
++	if (src_files != dst_files)
++		spin_lock(&src_files->file_lock);
++	err = expand_files(dst_files, newfd);
+ 	file = fcheck(oldfd);
+ 	if (unlikely(!file))
+ 		goto Ebadf;
+@@ -911,19 +938,34 @@ SYSCALL_DEFINE3(dup3, unsigned int, oldf
+ 			goto Ebadf;
+ 		goto out_unlock;
+ 	}
+-	return do_dup2(files, file, newfd, flags);
++	// Make sure `file` doesn't evaporate while we do dup2
++	// (as we're possibly releasing src_files spinlock soon).
++	get_file(file);
++	if (src_files != dst_files)
++		spin_unlock(&src_files->file_lock);
++	err = do_dup2(dst_files, file, newfd, flags);
++	// Decrease the reference counter in old file.
++	fput(file);
++	return err;
+ 
+ Ebadf:
+ 	err = -EBADF;
+ out_unlock:
+-	spin_unlock(&files->file_lock);
++	if (src_files != dst_files)
++		spin_unlock(&src_files->file_lock);
++	spin_unlock(&dst_files->file_lock);
+ 	return err;
+ }
+ 
+-SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
++SYSCALL_DEFINE3(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
++{
++	return dup3_to_ctx(oldfd, newfd, flags, current);
++}
++
++int dup2_to_ctx(unsigned int oldfd, unsigned int newfd, struct task_struct *ctx)
+ {
+-	if (unlikely(newfd == oldfd)) { /* corner case */
+-		struct files_struct *files = current->files;
++	if (unlikely(newfd == oldfd && ctx == current)) { /* corner case */
++		struct files_struct *files = ctx->files;
+ 		int retval = oldfd;
+ 
+ 		rcu_read_lock();
+@@ -932,7 +974,12 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldf
+ 		rcu_read_unlock();
+ 		return retval;
+ 	}
+-	return sys_dup3(oldfd, newfd, 0);
++	return dup3_to_ctx(oldfd, newfd, 0, ctx);
++}
++
++SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
++{
++	return dup2_to_ctx(oldfd, newfd, current);
+ }
+ 
+ SYSCALL_DEFINE1(dup, unsigned int, fildes)
+diff -uprN a/fs/file_table.c b/fs/file_table.c
+--- a/fs/file_table.c	2018-06-09 12:25:53.483825328 -0700
++++ b/fs/file_table.c	2018-06-10 11:31:33.000000000 -0700
+@@ -261,11 +261,9 @@ void flush_delayed_fput(void)
+ 
+ static DECLARE_DELAYED_WORK(delayed_fput_work, delayed_fput);
+ 
+-void fput(struct file *file)
++void fput_ctx(struct file *file, struct task_struct *task)
+ {
+ 	if (atomic_long_dec_and_test(&file->f_count)) {
+-		struct task_struct *task = current;
+-
+ 		if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+ 			init_task_work(&file->f_u.fu_rcuhead, ____fput);
+ 			if (!task_work_add(task, &file->f_u.fu_rcuhead, true))
+@@ -282,6 +280,11 @@ void fput(struct file *file)
+ 	}
+ }
+ 
++void fput(struct file *file)
++{
++	fput_ctx(file, current);
++}
++
+ /*
+  * synchronous analog of fput(); for kernel threads that might be needed
+  * in some umount() (and thus can't use flush_delayed_fput() without
+diff -uprN a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+--- a/fs/hugetlbfs/inode.c	2018-06-09 12:25:52.540491957 -0700
++++ b/fs/hugetlbfs/inode.c	2018-06-10 11:44:56.000000000 -0700
+@@ -1232,13 +1232,10 @@ static const struct dentry_operations an
+ 	.d_dname = simple_dname
+ };
+ 
+-/*
+- * Note that size should be aligned to proper hugepage size in caller side,
+- * otherwise hugetlb_reserve_pages reserves one less hugepages than intended.
+- */
+-struct file *hugetlb_file_setup(const char *name, size_t size,
++struct file *hugetlb_file_setup_ctx(const char *name, size_t size,
+ 				vm_flags_t acctflag, struct user_struct **user,
+-				int creat_flags, int page_size_log)
++				int creat_flags, int page_size_log,
++				struct task_struct *ctx)
+ {
+ 	struct file *file = ERR_PTR(-ENOMEM);
+ 	struct inode *inode;
+@@ -1256,12 +1253,13 @@ struct file *hugetlb_file_setup(const ch
+ 		return ERR_PTR(-ENOENT);
+ 
+ 	if (creat_flags == HUGETLB_SHMFS_INODE && !can_do_hugetlb_shm()) {
+-		*user = current_user();
++		*user = rcu_dereference_protected(ctx->cred, 1)->user;
++		//*user = current_user();
+ 		if (user_shm_lock(size, *user)) {
+-			task_lock(current);
++			task_lock(ctx);
+ 			pr_warn_once("%s (%d): Using mlock ulimits for SHM_HUGETLB is deprecated\n",
+-				current->comm, current->pid);
+-			task_unlock(current);
++				ctx->comm, ctx->pid);
++			task_unlock(ctx);
+ 		} else {
+ 			*user = NULL;
+ 			return ERR_PTR(-EPERM);
+@@ -1314,6 +1312,18 @@ out_shm_unlock:
+ 	return file;
+ }
+ 
++/*
++ * Note that size should be aligned to proper hugepage size in caller side,
++ * otherwise hugetlb_reserve_pages reserves one less hugepages than intended.
++ */
++struct file *hugetlb_file_setup(const char *name, size_t size,
++				vm_flags_t acctflag, struct user_struct **user,
++				int creat_flags, int page_size_log)
++{
++	return hugetlb_file_setup_ctx(name, size, acctflag, user, creat_flags,
++		page_size_log, current);
++}
++
+ static int __init init_hugetlbfs_fs(void)
+ {
+ 	struct hstate *h;
+diff -uprN a/fs/locks.c b/fs/locks.c
+--- a/fs/locks.c	2018-06-09 12:25:53.133825314 -0700
++++ b/fs/locks.c	2018-06-10 11:31:33.000000000 -0700
+@@ -127,6 +127,7 @@
+ #include <linux/pid_namespace.h>
+ #include <linux/hashtable.h>
+ #include <linux/percpu.h>
++#include <linux/sched.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/filelock.h>
+@@ -1251,9 +1252,9 @@ static int posix_lock_inode_wait(struct
+  * @file: the file to check
+  *
+  * Searches the inode's list of locks to find any POSIX locks which conflict.
+- * This function is called from locks_verify_locked() only.
++ * This function is called from locks_verify_locked_ctx() only.
+  */
+-int locks_mandatory_locked(struct file *file)
++int locks_mandatory_locked_ctx(struct file *file, struct task_struct *task_ctx)
+ {
+ 	int ret;
+ 	struct inode *inode = locks_inode(file);
+@@ -1270,7 +1271,7 @@ int locks_mandatory_locked(struct file *
+ 	spin_lock(&ctx->flc_lock);
+ 	ret = 0;
+ 	list_for_each_entry(fl, &ctx->flc_posix, fl_list) {
+-		if (fl->fl_owner != current->files &&
++		if (fl->fl_owner != task_ctx->files &&
+ 		    fl->fl_owner != file) {
+ 			ret = -EAGAIN;
+ 			break;
+@@ -1279,6 +1280,7 @@ int locks_mandatory_locked(struct file *
+ 	spin_unlock(&ctx->flc_lock);
+ 	return ret;
+ }
++EXPORT_SYMBOL(locks_mandatory_locked_ctx);
+ 
+ /**
+  * locks_mandatory_area - Check for a conflicting lock
+diff -uprN a/fs/open.c b/fs/open.c
+--- a/fs/open.c	2018-06-09 12:25:53.053825311 -0700
++++ b/fs/open.c	2018-06-10 11:31:33.000000000 -0700
+@@ -1124,9 +1124,9 @@ EXPORT_SYMBOL(filp_close);
+  * releasing the fd. This ensures that one clone task can't release
+  * an fd while another clone is opening it.
+  */
+-SYSCALL_DEFINE1(close, unsigned int, fd)
++int close_ctx(unsigned int fd, struct task_struct *ctx)
+ {
+-	int retval = __close_fd(current->files, fd);
++	int retval = __close_fd(ctx->files, fd);
+ 
+ 	/* can't restart close syscall because file table entry was cleared */
+ 	if (unlikely(retval == -ERESTARTSYS ||
+@@ -1137,6 +1137,11 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
+ 
+ 	return retval;
+ }
++
++SYSCALL_DEFINE1(close, unsigned int, fd)
++{
++	return close_ctx(fd, current);
++}
+ EXPORT_SYMBOL(sys_close);
+ 
+ /*
+diff -uprN a/include/linux/file.h b/include/linux/file.h
+--- a/include/linux/file.h	2018-06-09 12:26:19.510493046 -0700
++++ b/include/linux/file.h	2018-06-10 11:32:34.000000000 -0700
+@@ -8,6 +8,7 @@
+ #include <linux/compiler.h>
+ #include <linux/types.h>
+ #include <linux/posix_types.h>
++#include <linux/sched.h>
+ 
+ struct file;
+ 
+@@ -26,6 +27,8 @@ static inline void fput_light(struct fil
+ 		fput(file);
+ }
+ 
++extern void fput_ctx(struct file *, struct task_struct *ctx);
++
+ struct fd {
+ 	struct file *file;
+ 	unsigned int flags;
+@@ -41,6 +44,8 @@ static inline void fdput(struct fd fd)
+ 
+ extern struct file *fget(unsigned int fd);
+ extern struct file *fget_raw(unsigned int fd);
++extern struct file *fget_ctx(unsigned int fd, struct task_struct *ctx);
++extern struct file *fget_raw_ctx(unsigned int fd, struct task_struct *ctx);
+ extern unsigned long __fdget(unsigned int fd);
+ extern unsigned long __fdget_raw(unsigned int fd);
+ extern unsigned long __fdget_pos(unsigned int fd);
+@@ -73,15 +78,22 @@ static inline void fdput_pos(struct fd f
+ 	fdput(f);
+ }
+ 
++extern int dup3_to_ctx(unsigned int oldfd, unsigned int newfd, int flags,
++	struct task_struct *ctx);
++extern int dup2_to_ctx(unsigned int oldfd, unsigned int newfd,
++	struct task_struct *ctx);
+ extern int f_dupfd(unsigned int from, struct file *file, unsigned flags);
+ extern int replace_fd(unsigned fd, struct file *file, unsigned flags);
+ extern void set_close_on_exec(unsigned int fd, int flag);
+ extern bool get_close_on_exec(unsigned int fd);
+ extern void put_filp(struct file *);
+ extern int get_unused_fd_flags(unsigned flags);
++extern int get_unused_fd_flags_ctx(unsigned flags, struct task_struct *ctx);
+ extern void put_unused_fd(unsigned int fd);
+ 
+ extern void fd_install(unsigned int fd, struct file *file);
++extern void fd_install_ctx(unsigned int fd, struct file *file,
++	struct task_struct *ctx);
+ 
+ extern void flush_delayed_fput(void);
+ extern void __fput_sync(struct file *);
+diff -uprN a/include/linux/fs.h b/include/linux/fs.h
+--- a/include/linux/fs.h	2018-06-09 12:26:20.347159747 -0700
++++ b/include/linux/fs.h	2018-06-10 11:32:34.000000000 -0700
+@@ -2148,6 +2148,7 @@ extern struct kobject *fs_kobj;
+ 
+ #ifdef CONFIG_MANDATORY_FILE_LOCKING
+ extern int locks_mandatory_locked(struct file *);
++extern int locks_mandatory_locked_ctx(struct file *, struct task_struct *ctx);
+ extern int locks_mandatory_area(struct inode *, struct file *, loff_t, loff_t, unsigned char);
+ 
+ /*
+@@ -2170,13 +2171,19 @@ static inline int mandatory_lock(struct
+ 	return IS_MANDLOCK(ino) && __mandatory_lock(ino);
+ }
+ 
+-static inline int locks_verify_locked(struct file *file)
++static inline int locks_verify_locked_ctx(struct file *file,
++					struct task_struct *ctx)
+ {
+ 	if (mandatory_lock(locks_inode(file)))
+-		return locks_mandatory_locked(file);
++		return locks_mandatory_locked_ctx(file, ctx);
+ 	return 0;
+ }
+ 
++static inline int locks_verify_locked(struct file *file)
++{
++	return locks_verify_locked_ctx(file, current);
++}
++
+ static inline int locks_verify_truncate(struct inode *inode,
+ 				    struct file *f,
+ 				    loff_t size)
+@@ -2343,6 +2350,7 @@ extern struct file *file_open_root(struc
+ 				   const char *, int, umode_t);
+ extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ extern int filp_close(struct file *, fl_owner_t id);
++extern int close_ctx(unsigned int fd, struct task_struct *ctx);
+ 
+ extern struct filename *getname_flags(const char __user *, int, int *);
+ extern struct filename *getname(const char __user *);
+diff -uprN a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+--- a/include/linux/hugetlb.h	2018-06-09 12:26:19.913826396 -0700
++++ b/include/linux/hugetlb.h	2018-06-10 11:32:34.000000000 -0700
+@@ -263,6 +263,10 @@ extern const struct vm_operations_struct
+ struct file *hugetlb_file_setup(const char *name, size_t size, vm_flags_t acct,
+ 				struct user_struct **user, int creat_flags,
+ 				int page_size_log);
++struct file *hugetlb_file_setup_ctx(const char *name, size_t size,
++				vm_flags_t acct, struct user_struct **user,
++				int creat_flags, int page_size_log,
++				struct task_struct *ctx);
+ 
+ static inline bool is_file_hugepages(struct file *file)
+ {
+@@ -283,6 +287,14 @@ hugetlb_file_setup(const char *name, siz
+ {
+ 	return ERR_PTR(-ENOSYS);
+ }
++
++static inline struct file *
++hugetlb_file_setup_ctx(const char *name, size_t size, vm_flags_t acctflag,
++		struct user_struct **user, int creat_flags,
++		int page_size_log, struct task_struct *ctx)
++{
++	return ERR_PTR(-ENOSYS);
++}
+ 
+ #endif /* !CONFIG_HUGETLBFS */
+ 
+diff -uprN a/include/linux/mm.h b/include/linux/mm.h
+--- a/include/linux/mm.h	2018-06-09 12:26:20.237159742 -0700
++++ b/include/linux/mm.h	2018-06-10 11:32:34.000000000 -0700
+@@ -2011,6 +2011,8 @@ extern struct file *get_mm_exe_file(stru
+ extern struct file *get_task_exe_file(struct task_struct *task);
+ 
+ extern bool may_expand_vm(struct mm_struct *, vm_flags_t, unsigned long npages);
++extern bool may_expand_vm_ctx(struct mm_struct *, vm_flags_t,
++			unsigned long npages, struct task_struct *ctx);
+ extern void vm_stat_account(struct mm_struct *, vm_flags_t, long npages);
+ 
+ extern bool vma_is_special_mapping(const struct vm_area_struct *vma,
+@@ -2025,14 +2027,29 @@ extern int install_special_mapping(struc
+ 				   unsigned long flags, struct page **pages);
+ 
+ extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
++extern unsigned long get_unmapped_area_ctx(struct file *, unsigned long,
++	unsigned long, unsigned long, unsigned long, struct task_struct *);
+ 
+ extern unsigned long mmap_region(struct file *file, unsigned long addr,
+ 	unsigned long len, vm_flags_t vm_flags, unsigned long pgoff);
++extern unsigned long mmap_region_ctx(struct file *file, unsigned long addr,
++	unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
++	struct task_struct *ctx);
+ extern unsigned long do_mmap(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot, unsigned long flags,
+ 	vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate);
++extern unsigned long do_mmap_ctx(struct file *file, unsigned long addr,
++	unsigned long len, unsigned long prot, unsigned long flags,
++	vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate,
++	struct task_struct *ctx);
+ extern int do_munmap(struct mm_struct *, unsigned long, size_t);
++extern int do_munmap_ctx(struct mm_struct *, unsigned long, size_t,
++	struct task_struct *);
+ 
++unsigned long mmap_pgoff_ctx(unsigned long addr, unsigned long len,
++				unsigned long prot, unsigned long flags,
++				unsigned long fd, unsigned long pgoff,
++				struct task_struct *ctx);
+ static inline unsigned long
+ do_mmap_pgoff(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot, unsigned long flags,
+@@ -2041,6 +2058,22 @@ do_mmap_pgoff(struct file *file, unsigne
+ 	return do_mmap(file, addr, len, prot, flags, 0, pgoff, populate);
+ }
+ 
++static inline unsigned long
++do_mmap_pgoff_ctx(struct file *file, unsigned long addr,
++	unsigned long len, unsigned long prot, unsigned long flags,
++	unsigned long pgoff, unsigned long *populate,
++	struct task_struct *ctx)
++{
++	return do_mmap_ctx(file, addr, len, prot, flags, 0, pgoff, populate,
++				ctx);
++}
++
++extern unsigned long mremap_ctx(unsigned long addr, unsigned long old_len,
++		unsigned long new_len, unsigned long flags,
++		unsigned long new_addr, struct task_struct *ctx);
++extern unsigned long mprotect_ctx(unsigned long start, size_t len,
++		unsigned long prot, struct task_struct *ctx);
++
+ #ifdef CONFIG_MMU
+ extern int __mm_populate(unsigned long addr, unsigned long len,
+ 			 int ignore_errors);
+@@ -2049,16 +2082,31 @@ static inline void mm_populate(unsigned
+ 	/* Ignore errors */
+ 	(void) __mm_populate(addr, len, 1);
+ }
++extern int __mm_populate_ctx(unsigned long addr, unsigned long len,
++			 int ignore_errors, struct task_struct *ctx);
++static inline void mm_populate_ctx(unsigned long addr, unsigned long len,
++			struct task_struct *ctx)
++{
++	/* Ignore errors */
++	(void) __mm_populate_ctx(addr, len, 1, ctx);
++}
+ #else
+ static inline void mm_populate(unsigned long addr, unsigned long len) {}
++static inline void mm_populate_ctx(unsigned long addr, unsigned long len,
++		struct task_struct *ctx) {}
+ #endif
+ 
+ /* These take the mm semaphore themselves */
+ extern int __must_check vm_brk(unsigned long, unsigned long);
+ extern int vm_munmap(unsigned long, size_t);
++extern int vm_munmap_ctx(unsigned long, size_t, struct task_struct *);
+ extern unsigned long __must_check vm_mmap(struct file *, unsigned long,
+         unsigned long, unsigned long,
+         unsigned long, unsigned long);
++extern unsigned long __must_check vm_mmap_ctx(struct file *, unsigned long,
++        unsigned long, unsigned long,
++        unsigned long, unsigned long,
++	struct task_struct *);
+ 
+ struct vm_unmapped_area_info {
+ #define VM_UNMAPPED_AREA_TOPDOWN 1
+diff -uprN a/include/linux/ptrace_remote.h b/include/linux/ptrace_remote.h
+--- a/include/linux/ptrace_remote.h	1969-12-31 16:00:00.000000000 -0800
++++ b/include/linux/ptrace_remote.h	2018-06-10 11:32:34.000000000 -0700
+@@ -0,0 +1,70 @@
++#ifndef PTRACE_REMOTE_H
++#define PTRACE_REMOTE_H
++
++#ifdef __KERNEL__
++#include <linux/kernel.h>
++#else
++#include <stdint.h>
++#endif
++
++#define PTRACE_REMOTE_MMAP	50
++#define PTRACE_REMOTE_MUNMAP	51
++#define PTRACE_REMOTE_MREMAP	52
++#define PTRACE_REMOTE_MPROTECT	53
++#define PTRACE_DUP_TO_REMOTE	54
++#define PTRACE_DUP2_TO_REMOTE	55
++#define PTRACE_DUP_FROM_REMOTE	56
++#define PTRACE_REMOTE_CLOSE	57
++
++struct ptrace_remote_mmap {
++	uint64_t addr;
++	uint64_t length;
++	uint32_t prot;
++	uint32_t flags;
++	uint32_t fd;
++	uint32_t _pad;
++	uint64_t offset;
++};
++
++struct ptrace_remote_munmap {
++	uint64_t addr;
++	uint64_t length;
++};
++
++struct ptrace_remote_mremap {
++	uint64_t old_addr;
++	uint64_t old_size;
++	uint64_t new_addr;
++	uint64_t new_size;
++	uint32_t flags;
++	uint32_t _pad;
++};
++
++struct ptrace_remote_mprotect {
++	uint64_t addr;
++	uint64_t length;
++	uint32_t prot;
++	uint32_t _pad;
++};
++
++struct ptrace_dup_to_remote {
++	uint32_t local_fd;
++	uint32_t flags;
++};
++
++struct ptrace_dup2_to_remote {
++	uint32_t local_fd;
++	uint32_t remote_fd;
++	uint32_t flags;
++};
++
++struct ptrace_dup_from_remote {
++	uint32_t remote_fd;
++	uint32_t flags;
++};
++
++struct ptrace_remote_close {
++	uint32_t remote_fd;
++};
++
++#endif
+diff -uprN a/include/linux/uprobes.h b/include/linux/uprobes.h
+--- a/include/linux/uprobes.h	2018-06-09 12:26:19.823826392 -0700
++++ b/include/linux/uprobes.h	2018-06-10 11:32:34.000000000 -0700
+@@ -124,6 +124,7 @@ extern int uprobe_write_opcode(struct mm
+ extern int uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *uc);
+ extern int uprobe_apply(struct inode *inode, loff_t offset, struct uprobe_consumer *uc, bool);
+ extern void uprobe_unregister(struct inode *inode, loff_t offset, struct uprobe_consumer *uc);
++extern int uprobe_mmap_ctx(struct vm_area_struct *vma);
+ extern int uprobe_mmap(struct vm_area_struct *vma);
+ extern void uprobe_munmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+ extern void uprobe_start_dup_mmap(void);
+@@ -172,6 +173,10 @@ static inline int uprobe_mmap(struct vm_
+ {
+ 	return 0;
+ }
++static inline int uprobe_mmap_ctx(struct vm_area_struct *vma, struct task_struct *ctx)
++{
++	return 0;
++}
+ static inline void
+ uprobe_munmap(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+ {
+diff -uprN a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+--- a/kernel/events/uprobes.c	2018-06-09 12:26:19.037159694 -0700
++++ b/kernel/events/uprobes.c	2018-06-10 11:32:34.000000000 -0700
+@@ -1049,14 +1049,7 @@ static void build_probe_list(struct inod
+ 	spin_unlock(&uprobes_treelock);
+ }
+ 
+-/*
+- * Called from mmap_region/vma_adjust with mm->mmap_sem acquired.
+- *
+- * Currently we ignore all errors and always return 0, the callers
+- * can't handle the failure anyway.
+- */
+-int uprobe_mmap(struct vm_area_struct *vma)
+-{
++int uprobe_mmap_ctx(struct vm_area_struct *vma, struct task_struct *ctx) {
+ 	struct list_head tmp_list;
+ 	struct uprobe *uprobe, *u;
+ 	struct inode *inode;
+@@ -1076,7 +1069,7 @@ int uprobe_mmap(struct vm_area_struct *v
+ 	 * consumers have gone away.
+ 	 */
+ 	list_for_each_entry_safe(uprobe, u, &tmp_list, pending_list) {
+-		if (!fatal_signal_pending(current) &&
++		if (!fatal_signal_pending(ctx) &&
+ 		    filter_chain(uprobe, UPROBE_FILTER_MMAP, vma->vm_mm)) {
+ 			unsigned long vaddr = offset_to_vaddr(vma, uprobe->offset);
+ 			install_breakpoint(uprobe, vma->vm_mm, vma, vaddr);
+@@ -1088,6 +1081,17 @@ int uprobe_mmap(struct vm_area_struct *v
+ 	return 0;
+ }
+ 
++/*
++ * Called from mmap_region/vma_adjust with mm->mmap_sem acquired.
++ *
++ * Currently we ignore all errors and always return 0, the callers
++ * can't handle the failure anyway.
++ */
++int uprobe_mmap(struct vm_area_struct *vma)
++{
++	return uprobe_mmap_ctx(vma, current);
++}
++
+ static bool
+ vma_has_uprobes(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+ {
+diff -uprN a/kernel/ptrace.c b/kernel/ptrace.c
+--- a/kernel/ptrace.c	2018-06-09 12:26:18.977159692 -0700
++++ b/kernel/ptrace.c	2018-06-10 11:32:34.000000000 -0700
+@@ -12,9 +12,11 @@
+ #include <linux/sched.h>
+ #include <linux/errno.h>
+ #include <linux/mm.h>
++#include <linux/file.h>
+ #include <linux/highmem.h>
+ #include <linux/pagemap.h>
+ #include <linux/ptrace.h>
++#include <linux/ptrace_remote.h>
+ #include <linux/security.h>
+ #include <linux/signal.h>
+ #include <linux/uio.h>
+@@ -867,6 +869,27 @@ static int ptrace_regset(struct task_str
+ EXPORT_SYMBOL_GPL(task_user_regset_view);
+ #endif
+ 
++static int ptrace_dup_remote(int src_fd, struct task_struct *src_ctx,
++	struct task_struct *dst_ctx, int flags)
++{
++	int ret;
++	struct file *file;
++
++	if (flags & ~O_CLOEXEC)
++		return -EINVAL;
++
++	file = fget_raw_ctx(src_fd, src_ctx);
++	if (!file)
++		return -EBADF;
++
++	ret = get_unused_fd_flags_ctx(flags, dst_ctx);
++	if (ret >= 0)
++		fd_install_ctx(ret, file, dst_ctx);
++	else
++		fput_ctx(file, src_ctx);
++	return ret;
++}
++
+ int ptrace_request(struct task_struct *child, long request,
+ 		   unsigned long addr, unsigned long data)
+ {
+@@ -1079,6 +1102,127 @@ int ptrace_request(struct task_struct *c
+ 		ret = seccomp_get_filter(child, addr, datavp);
+ 		break;
+ 
++	case PTRACE_REMOTE_MMAP: {
++		struct ptrace_remote_mmap prmmap;
++		struct ptrace_remote_mmap __user *user_mmap = datavp;
++		long mmap_ret;
++
++		if (copy_from_user(&prmmap, user_mmap, sizeof(prmmap)))
++			return -EFAULT;
++		if (!access_ok(VERIFY_WRITE, &user_mmap->addr,
++				sizeof(user_mmap->addr)))
++			return -EFAULT;
++
++		if (prmmap.offset & ~PAGE_MASK)
++			return -EINVAL;
++		mmap_ret = mmap_pgoff_ctx(prmmap.addr, prmmap.length,
++			prmmap.prot, prmmap.flags, prmmap.fd,
++			prmmap.offset >> PAGE_SHIFT, child);
++		if (IS_ERR_VALUE(mmap_ret)) {
++			ret = mmap_ret;
++		} else {
++			__put_user(mmap_ret, &user_mmap->addr);
++			ret = 0;
++		}
++
++		break;
++	}
++
++	case PTRACE_REMOTE_MUNMAP: {
++		struct ptrace_remote_munmap prmunmap;
++		struct ptrace_remote_munmap __user *user_munmap = datavp;
++
++		if (copy_from_user(&prmunmap, user_munmap, sizeof(prmunmap)))
++			return -EFAULT;
++
++		ret = vm_munmap_ctx(prmunmap.addr, prmunmap.length, child);
++
++		break;
++	}
++
++	case PTRACE_REMOTE_MREMAP: {
++		struct ptrace_remote_mremap prmremap;
++		struct ptrace_remote_mremap __user *user_mremap = datavp;
++		long mremap_ret;
++
++		if (copy_from_user(&prmremap, user_mremap, sizeof(prmremap)))
++			return -EFAULT;
++		if (!access_ok(VERIFY_WRITE, &user_mremap->new_addr,
++				sizeof(user_mremap->new_addr)))
++			return -EFAULT;
++
++		mremap_ret = mremap_ctx(prmremap.old_addr, prmremap.old_size,
++			prmremap.new_size, prmremap.flags, prmremap.new_addr,
++			child);
++
++		if (IS_ERR_VALUE(mremap_ret)) {
++			ret = mremap_ret;
++		} else {
++			__put_user(mremap_ret, &user_mremap->new_addr);
++			ret = 0;
++		}
++
++		break;
++	}
++
++	case PTRACE_REMOTE_MPROTECT: {
++		struct ptrace_remote_mprotect prmprot;
++		struct ptrace_remote_mprotect __user *user_mprot = datavp;
++
++		if (copy_from_user(&prmprot, user_mprot, sizeof(prmprot)))
++			return -EFAULT;
++
++		ret = mprotect_ctx(prmprot.addr, prmprot.length, prmprot.prot,
++			child);
++
++		break;
++	}
++
++	case PTRACE_DUP_TO_REMOTE: {
++		struct ptrace_dup_to_remote dup_to;
++		struct ptrace_dup_to_remote __user *user_dup_to = datavp;
++
++		if (copy_from_user(&dup_to, user_dup_to, sizeof(dup_to)))
++			return -EFAULT;
++		ret = ptrace_dup_remote(dup_to.local_fd, current, child,
++			dup_to.flags);
++		break;
++	}
++
++	case PTRACE_DUP2_TO_REMOTE: {
++		struct ptrace_dup2_to_remote dup2_to;
++		struct ptrace_dup2_to_remote __user *user_dup2_to = datavp;
++
++		if (copy_from_user(&dup2_to, user_dup2_to, sizeof(dup2_to)))
++			return -EFAULT;
++		if (dup2_to.flags & ~O_CLOEXEC)
++			return -EINVAL;
++		ret = dup3_to_ctx(dup2_to.local_fd, dup2_to.remote_fd,
++			dup2_to.flags, child);
++		break;
++	}
++
++	case PTRACE_DUP_FROM_REMOTE: {
++		struct ptrace_dup_from_remote dup_from;
++		struct ptrace_dup_from_remote __user *user_dup_from = datavp;
++
++		if (copy_from_user(&dup_from, user_dup_from, sizeof(dup_from)))
++			return -EFAULT;
++		ret = ptrace_dup_remote(dup_from.remote_fd, child, current,
++			dup_from.flags);
++		break;
++	}
++
++	case PTRACE_REMOTE_CLOSE: {
++		struct ptrace_remote_close rclose;
++		struct ptrace_remote_close __user *user_rclose = datavp;
++
++		if (copy_from_user(&rclose, user_rclose, sizeof(rclose)))
++			return -EFAULT;
++		ret = close_ctx(rclose.remote_fd, child);
++		break;
++	}
++
+ 	default:
+ 		break;
+ 	}
+diff -uprN a/mm/gup.c b/mm/gup.c
+--- a/mm/gup.c	2018-06-09 12:26:18.907159688 -0700
++++ b/mm/gup.c	2018-06-10 11:32:34.000000000 -0700
+@@ -1045,16 +1045,10 @@ long populate_vma_page_range(struct vm_a
+ 				NULL, NULL, nonblocking);
+ }
+ 
+-/*
+- * __mm_populate - populate and/or mlock pages within a range of address space.
+- *
+- * This is used to implement mlock() and the MAP_POPULATE / MAP_LOCKED mmap
+- * flags. VMAs must be already marked with the desired vm_flags, and
+- * mmap_sem must not be held.
+- */
+-int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
++int __mm_populate_ctx(unsigned long start, unsigned long len, int ignore_errors,
++	struct task_struct *ctx)
+ {
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 	unsigned long end, nstart, nend;
+ 	struct vm_area_struct *vma = NULL;
+ 	int locked = 0;
+@@ -1107,6 +1101,18 @@ int __mm_populate(unsigned long start, u
+ 	return ret;	/* 0 or negative error code */
+ }
+ 
++/*
++ * __mm_populate - populate and/or mlock pages within a range of address space.
++ *
++ * This is used to implement mlock() and the MAP_POPULATE / MAP_LOCKED mmap
++ * flags. VMAs must be already marked with the desired vm_flags, and
++ * mmap_sem must not be held.
++ */
++int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
++{
++	return __mm_populate_ctx(start, len, ignore_errors, current);
++}
++
+ /**
+  * get_dump_page() - pin user page in memory while writing it to core dump
+  * @addr: user address
+diff -uprN a/mm/internal.h b/mm/internal.h
+--- a/mm/internal.h	2018-06-09 12:26:18.843826353 -0700
++++ b/mm/internal.h	2018-06-10 11:32:34.000000000 -0700
+@@ -448,6 +448,10 @@ extern u32 hwpoison_filter_enable;
+ extern unsigned long  __must_check vm_mmap_pgoff(struct file *, unsigned long,
+         unsigned long, unsigned long,
+         unsigned long, unsigned long);
++extern unsigned long  __must_check vm_mmap_pgoff_ctx(struct file *,
++	unsigned long, unsigned long,
++        unsigned long, unsigned long,
++	unsigned long, struct task_struct *ctx);
+ 
+ extern void set_pageblock_order(void);
+ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
+diff -uprN a/mm/mmap.c b/mm/mmap.c
+--- a/mm/mmap.c	2018-06-09 12:26:18.860493019 -0700
++++ b/mm/mmap.c	2018-06-10 11:32:34.000000000 -0700
+@@ -1298,15 +1298,13 @@ static inline int mlock_future_check(str
+ 	return 0;
+ }
+ 
+-/*
+- * The caller must hold down_write(&current->mm->mmap_sem).
+- */
+-unsigned long do_mmap(struct file *file, unsigned long addr,
+-			unsigned long len, unsigned long prot,
+-			unsigned long flags, vm_flags_t vm_flags,
+-			unsigned long pgoff, unsigned long *populate)
++unsigned long do_mmap_ctx(struct file *file, unsigned long addr,
++				unsigned long len, unsigned long prot,
++				unsigned long flags, vm_flags_t vm_flags,
++				unsigned long pgoff, unsigned long *populate,
++				struct task_struct *ctx)
+ {
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 	int pkey = 0;
+ 
+ 	*populate = 0;
+@@ -1320,7 +1318,7 @@ unsigned long do_mmap(struct file *file,
+ 	 * (the exception is when the underlying filesystem is noexec
+ 	 *  mounted, in which case we dont add PROT_EXEC.)
+ 	 */
+-	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
++	if ((prot & PROT_READ) && (ctx->personality & READ_IMPLIES_EXEC))
+ 		if (!(file && path_noexec(&file->f_path)))
+ 			prot |= PROT_EXEC;
+ 
+@@ -1343,7 +1341,7 @@ unsigned long do_mmap(struct file *file,
+ 	/* Obtain the address to map to. we verify (or select) it and ensure
+ 	 * that it represents a valid section of the address space.
+ 	 */
+-	addr = get_unmapped_area(file, addr, len, pgoff, flags);
++	addr = get_unmapped_area_ctx(file, addr, len, pgoff, flags, ctx);
+ 	if (offset_in_page(addr))
+ 		return addr;
+ 
+@@ -1385,7 +1383,7 @@ unsigned long do_mmap(struct file *file,
+ 			/*
+ 			 * Make sure there are no mandatory locks on the file.
+ 			 */
+-			if (locks_verify_locked(file))
++			if (locks_verify_locked_ctx(file, ctx))
+ 				return -EAGAIN;
+ 
+ 			vm_flags |= VM_SHARED | VM_MAYSHARE;
+@@ -1447,7 +1445,7 @@ unsigned long do_mmap(struct file *file,
+ 			vm_flags |= VM_NORESERVE;
+ 	}
+ 
+-	addr = mmap_region(file, addr, len, vm_flags, pgoff);
++	addr = mmap_region_ctx(file, addr, len, vm_flags, pgoff, ctx);
+ 	if (!IS_ERR_VALUE(addr) &&
+ 	    ((vm_flags & VM_LOCKED) ||
+ 	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
+@@ -1455,9 +1453,22 @@ unsigned long do_mmap(struct file *file,
+ 	return addr;
+ }
+ 
+-SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+-		unsigned long, prot, unsigned long, flags,
+-		unsigned long, fd, unsigned long, pgoff)
++/*
++ * The caller must hold down_write(&current->mm->mmap_sem).
++ */
++unsigned long do_mmap(struct file *file, unsigned long addr,
++			unsigned long len, unsigned long prot,
++			unsigned long flags, vm_flags_t vm_flags,
++			unsigned long pgoff, unsigned long *populate)
++{
++	return do_mmap_ctx(file, addr, len, prot, flags, vm_flags, pgoff,
++				populate, current);
++}
++
++unsigned long mmap_pgoff_ctx(unsigned long addr, unsigned long len,
++				unsigned long prot, unsigned long flags,
++				unsigned long fd, unsigned long pgoff,
++				struct task_struct *ctx)
+ {
+ 	struct file *file = NULL;
+ 	unsigned long retval;
+@@ -1487,23 +1498,32 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned lon
+ 		 * A dummy user value is used because we are not locking
+ 		 * memory so no accounting is necessary
+ 		 */
+-		file = hugetlb_file_setup(HUGETLB_ANON_FILE, len,
++		file = hugetlb_file_setup_ctx(HUGETLB_ANON_FILE, len,
+ 				VM_NORESERVE,
+ 				&user, HUGETLB_ANONHUGE_INODE,
+-				(flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
++				(flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK,
++				ctx);
+ 		if (IS_ERR(file))
+ 			return PTR_ERR(file);
+ 	}
+ 
+ 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+ 
+-	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
++	retval = vm_mmap_pgoff_ctx(file, addr, len, prot, flags, pgoff,
++			ctx);
+ out_fput:
+ 	if (file)
+ 		fput(file);
+ 	return retval;
+ }
+ 
++SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
++		unsigned long, prot, unsigned long, flags,
++		unsigned long, fd, unsigned long, pgoff)
++{
++	return mmap_pgoff_ctx(addr, len, prot, flags, fd, pgoff, current);
++}
++
+ #ifdef __ARCH_WANT_SYS_OLD_MMAP
+ struct mmap_arg_struct {
+ 	unsigned long addr;
+@@ -1582,17 +1602,18 @@ static inline int accountable_mapping(st
+ 	return (vm_flags & (VM_NORESERVE | VM_SHARED | VM_WRITE)) == VM_WRITE;
+ }
+ 
+-unsigned long mmap_region(struct file *file, unsigned long addr,
+-		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff)
++unsigned long mmap_region_ctx(struct file *file, unsigned long addr,
++		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
++		struct task_struct *ctx)
+ {
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 	struct vm_area_struct *vma, *prev;
+ 	int error;
+ 	struct rb_node **rb_link, *rb_parent;
+ 	unsigned long charged = 0;
+ 
+ 	/* Check against address space limit. */
+-	if (!may_expand_vm(mm, vm_flags, len >> PAGE_SHIFT)) {
++	if (!may_expand_vm_ctx(mm, vm_flags, len >> PAGE_SHIFT, ctx)) {
+ 		unsigned long nr_pages;
+ 
+ 		/*
+@@ -1704,14 +1725,14 @@ out:
+ 	vm_stat_account(mm, vm_flags, len >> PAGE_SHIFT);
+ 	if (vm_flags & VM_LOCKED) {
+ 		if (!((vm_flags & VM_SPECIAL) || is_vm_hugetlb_page(vma) ||
+-					vma == get_gate_vma(current->mm)))
++					vma == get_gate_vma(ctx->mm)))
+ 			mm->locked_vm += (len >> PAGE_SHIFT);
+ 		else
+ 			vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
+ 	}
+ 
+ 	if (file)
+-		uprobe_mmap(vma);
++		uprobe_mmap_ctx(vma, ctx);
+ 
+ 	/*
+ 	 * New (or expanded) vma always get soft dirty status.
+@@ -1746,6 +1767,11 @@ unacct_error:
+ 	return error;
+ }
+ 
++unsigned long mmap_region(struct file *file, unsigned long addr,
++		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff) {
++	return mmap_region_ctx(file, addr, len, vm_flags, pgoff, current);
++}
++
+ unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+ {
+ 	/*
+@@ -2046,8 +2072,9 @@ arch_get_unmapped_area_topdown(struct fi
+ #endif
+ 
+ unsigned long
+-get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+-		unsigned long pgoff, unsigned long flags)
++get_unmapped_area_ctx(struct file *file, unsigned long addr,
++		unsigned long len, unsigned long pgoff,
++		unsigned long flags, struct task_struct *ctx)
+ {
+ 	unsigned long (*get_area)(struct file *, unsigned long,
+ 				  unsigned long, unsigned long, unsigned long);
+@@ -2060,7 +2087,7 @@ get_unmapped_area(struct file *file, uns
+ 	if (len > TASK_SIZE)
+ 		return -ENOMEM;
+ 
+-	get_area = current->mm->get_unmapped_area;
++	get_area = ctx->mm->get_unmapped_area;
+ 	if (file) {
+ 		if (file->f_op->get_unmapped_area)
+ 			get_area = file->f_op->get_unmapped_area;
+@@ -2087,6 +2114,13 @@ get_unmapped_area(struct file *file, uns
+ 	return error ? error : addr;
+ }
+ 
++unsigned long
++get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
++		unsigned long pgoff, unsigned long flags)
++{
++	return get_unmapped_area_ctx(file, addr, len, pgoff, flags, current);
++}
++
+ EXPORT_SYMBOL(get_unmapped_area);
+ 
+ /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+@@ -2574,12 +2608,8 @@ int split_vma(struct mm_struct *mm, stru
+ 	return __split_vma(mm, vma, addr, new_below);
+ }
+ 
+-/* Munmap is split into 2 main parts -- this part which finds
+- * what needs doing, and the areas themselves, which do the
+- * work.  This now handles partial unmappings.
+- * Jeremy Fitzhardinge <jeremy@goop.org>
+- */
+-int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
++int do_munmap_ctx(struct mm_struct *mm, unsigned long start, size_t len,
++		struct task_struct *ctx)
+ {
+ 	unsigned long end;
+ 	struct vm_area_struct *vma, *prev, *last;
+@@ -2664,18 +2694,33 @@ int do_munmap(struct mm_struct *mm, unsi
+ 	return 0;
+ }
+ 
+-int vm_munmap(unsigned long start, size_t len)
++/* Munmap is split into 2 main parts -- this part which finds
++ * what needs doing, and the areas themselves, which do the
++ * work.  This now handles partial unmappings.
++ * Jeremy Fitzhardinge <jeremy@goop.org>
++ */
++int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
+ {
++	return do_munmap_ctx(mm, start, len, current);
++}
++
++int vm_munmap_ctx(unsigned long start, size_t len, struct task_struct *ctx) {
+ 	int ret;
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 
+ 	if (down_write_killable(&mm->mmap_sem))
+ 		return -EINTR;
+ 
+-	ret = do_munmap(mm, start, len);
++	ret = do_munmap_ctx(mm, start, len, ctx);
+ 	up_write(&mm->mmap_sem);
+ 	return ret;
+ }
++EXPORT_SYMBOL(vm_munmap_ctx);
++
++int vm_munmap(unsigned long start, size_t len)
++{
++	return vm_munmap_ctx(start, len, current);
++}
+ EXPORT_SYMBOL(vm_munmap);
+ 
+ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
+@@ -3072,24 +3117,23 @@ out:
+ 	return NULL;
+ }
+ 
+-/*
+- * Return true if the calling process may expand its vm space by the passed
+- * number of pages
+- */
+-bool may_expand_vm(struct mm_struct *mm, vm_flags_t flags, unsigned long npages)
++bool may_expand_vm_ctx(struct mm_struct *mm, vm_flags_t flags,
++		unsigned long npages, struct task_struct *ctx)
+ {
+-	if (mm->total_vm + npages > rlimit(RLIMIT_AS) >> PAGE_SHIFT)
++	if (mm->total_vm + npages > task_rlimit(ctx, RLIMIT_AS) >> PAGE_SHIFT)
+ 		return false;
+ 
+ 	if (is_data_mapping(flags) &&
+-	    mm->data_vm + npages > rlimit(RLIMIT_DATA) >> PAGE_SHIFT) {
++	    mm->data_vm + npages >
++	    		task_rlimit(ctx, RLIMIT_DATA) >> PAGE_SHIFT) {
+ 		/* Workaround for Valgrind */
+ 		if (rlimit(RLIMIT_DATA) == 0 &&
+-		    mm->data_vm + npages <= rlimit_max(RLIMIT_DATA) >> PAGE_SHIFT)
++		    mm->data_vm + npages <=
++		    		task_rlimit_max(ctx, RLIMIT_DATA) >> PAGE_SHIFT)
+ 			return true;
+ 		if (!ignore_rlimit_data) {
+ 			pr_warn_once("%s (%d): VmData %lu exceed data ulimit %lu. Update limits or use boot option ignore_rlimit_data.\n",
+-				     current->comm, current->pid,
++				     ctx->comm, ctx->pid,
+ 				     (mm->data_vm + npages) << PAGE_SHIFT,
+ 				     rlimit(RLIMIT_DATA));
+ 			return false;
+@@ -3099,6 +3143,15 @@ bool may_expand_vm(struct mm_struct *mm,
+ 	return true;
+ }
+ 
++/*
++ * Return true if the calling process may expand its vm space by the passed
++ * number of pages
++ */
++bool may_expand_vm(struct mm_struct *mm, vm_flags_t flags, unsigned long npages)
++{
++	return may_expand_vm_ctx(mm, flags, npages, current);
++}
++
+ void vm_stat_account(struct mm_struct *mm, vm_flags_t flags, long npages)
+ {
+ 	mm->total_vm += npages;
+diff -uprN a/mm/mprotect.c b/mm/mprotect.c
+--- a/mm/mprotect.c	2018-06-09 12:26:18.887159688 -0700
++++ b/mm/mprotect.c	2018-06-10 11:32:34.000000000 -0700
+@@ -357,14 +357,14 @@ fail:
+ /*
+  * pkey==-1 when doing a legacy mprotect()
+  */
+-static int do_mprotect_pkey(unsigned long start, size_t len,
+-		unsigned long prot, int pkey)
++static int do_mprotect_pkey_ctx(unsigned long start, size_t len,
++		unsigned long prot, int pkey, struct task_struct *ctx)
+ {
+ 	unsigned long nstart, end, tmp, reqprot;
+ 	struct vm_area_struct *vma, *prev;
+ 	int error = -EINVAL;
+ 	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
+-	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
++	const bool rier = (ctx->personality & READ_IMPLIES_EXEC) &&
+ 				(prot & PROT_READ);
+ 
+ 	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
+@@ -384,7 +384,7 @@ static int do_mprotect_pkey(unsigned lon
+ 
+ 	reqprot = prot;
+ 
+-	if (down_write_killable(&current->mm->mmap_sem))
++	if (down_write_killable(&ctx->mm->mmap_sem))
+ 		return -EINTR;
+ 
+ 	/*
+@@ -392,10 +392,10 @@ static int do_mprotect_pkey(unsigned lon
+ 	 * them use it here.
+ 	 */
+ 	error = -EINVAL;
+-	if ((pkey != -1) && !mm_pkey_is_allocated(current->mm, pkey))
++	if ((pkey != -1) && !mm_pkey_is_allocated(ctx->mm, pkey))
+ 		goto out;
+ 
+-	vma = find_vma(current->mm, start);
++	vma = find_vma(ctx->mm, start);
+ 	error = -ENOMEM;
+ 	if (!vma)
+ 		goto out;
+@@ -474,20 +474,26 @@ static int do_mprotect_pkey(unsigned lon
+ 		prot = reqprot;
+ 	}
+ out:
+-	up_write(&current->mm->mmap_sem);
++	up_write(&ctx->mm->mmap_sem);
+ 	return error;
+ }
+ 
++unsigned long mprotect_ctx(unsigned long start, size_t len, unsigned long prot,
++		struct task_struct *ctx)
++{
++	return do_mprotect_pkey_ctx(start, len, prot, -1, ctx);
++}
++
+ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot)
+ {
+-	return do_mprotect_pkey(start, len, prot, -1);
++	return do_mprotect_pkey_ctx(start, len, prot, -1, current);
+ }
+ 
+ SYSCALL_DEFINE4(pkey_mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot, int, pkey)
+ {
+-	return do_mprotect_pkey(start, len, prot, pkey);
++	return do_mprotect_pkey_ctx(start, len, prot, pkey, current);
+ }
+ 
+ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
+diff -uprN a/mm/mremap.c b/mm/mremap.c
+--- a/mm/mremap.c	2018-06-09 12:26:18.883826354 -0700
++++ b/mm/mremap.c	2018-06-10 11:32:34.000000000 -0700
+@@ -360,10 +360,11 @@ static unsigned long move_vma(struct vm_
+ 	return new_addr;
+ }
+ 
+-static struct vm_area_struct *vma_to_resize(unsigned long addr,
+-	unsigned long old_len, unsigned long new_len, unsigned long *p)
++static struct vm_area_struct *vma_to_resize_ctx(unsigned long addr,
++	unsigned long old_len, unsigned long new_len, unsigned long *p,
++	struct task_struct *ctx)
+ {
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 	struct vm_area_struct *vma = find_vma(mm, addr);
+ 	unsigned long pgoff;
+ 
+@@ -392,7 +393,7 @@ static struct vm_area_struct *vma_to_res
+ 	if (vma->vm_flags & VM_LOCKED) {
+ 		unsigned long locked, lock_limit;
+ 		locked = mm->locked_vm << PAGE_SHIFT;
+-		lock_limit = rlimit(RLIMIT_MEMLOCK);
++		lock_limit = task_rlimit(ctx, RLIMIT_MEMLOCK);
+ 		locked += new_len - old_len;
+ 		if (locked > lock_limit && !capable(CAP_IPC_LOCK))
+ 			return ERR_PTR(-EAGAIN);
+@@ -412,10 +413,11 @@ static struct vm_area_struct *vma_to_res
+ 	return vma;
+ }
+ 
+-static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
+-		unsigned long new_addr, unsigned long new_len, bool *locked)
++static unsigned long mremap_to_ctx(unsigned long addr, unsigned long old_len,
++		unsigned long new_addr, unsigned long new_len, bool *locked,
++		struct task_struct *ctx)
+ {
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long ret = -EINVAL;
+ 	unsigned long charged = 0;
+@@ -431,18 +433,18 @@ static unsigned long mremap_to(unsigned
+ 	if (addr + old_len > new_addr && new_addr + new_len > addr)
+ 		goto out;
+ 
+-	ret = do_munmap(mm, new_addr, new_len);
++	ret = do_munmap_ctx(mm, new_addr, new_len, ctx);
+ 	if (ret)
+ 		goto out;
+ 
+ 	if (old_len >= new_len) {
+-		ret = do_munmap(mm, addr+new_len, old_len - new_len);
++		ret = do_munmap_ctx(mm, addr+new_len, old_len - new_len, ctx);
+ 		if (ret && old_len != new_len)
+ 			goto out;
+ 		old_len = new_len;
+ 	}
+ 
+-	vma = vma_to_resize(addr, old_len, new_len, &charged);
++	vma = vma_to_resize_ctx(addr, old_len, new_len, &charged, ctx);
+ 	if (IS_ERR(vma)) {
+ 		ret = PTR_ERR(vma);
+ 		goto out;
+@@ -452,9 +454,9 @@ static unsigned long mremap_to(unsigned
+ 	if (vma->vm_flags & VM_MAYSHARE)
+ 		map_flags |= MAP_SHARED;
+ 
+-	ret = get_unmapped_area(vma->vm_file, new_addr, new_len, vma->vm_pgoff +
+-				((addr - vma->vm_start) >> PAGE_SHIFT),
+-				map_flags);
++	ret = get_unmapped_area_ctx(vma->vm_file, new_addr, new_len,
++			vma->vm_pgoff +	((addr - vma->vm_start) >> PAGE_SHIFT),
++			map_flags, ctx);
+ 	if (offset_in_page(ret))
+ 		goto out1;
+ 
+@@ -468,6 +470,12 @@ out:
+ 	return ret;
+ }
+ 
++// static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
++// 		unsigned long new_addr, unsigned long new_len, bool *locked)
++// {
++// 	return mremap_to_ctx(addr, old_len, new_addr, new_len, locked, current);
++// }
++
+ static int vma_expandable(struct vm_area_struct *vma, unsigned long delta)
+ {
+ 	unsigned long end = vma->vm_end + delta;
+@@ -481,18 +489,11 @@ static int vma_expandable(struct vm_area
+ 	return 1;
+ }
+ 
+-/*
+- * Expand (or shrink) an existing mapping, potentially moving it at the
+- * same time (controlled by the MREMAP_MAYMOVE flag and available VM space)
+- *
+- * MREMAP_FIXED option added 5-Dec-1999 by Benjamin LaHaise
+- * This option implies MREMAP_MAYMOVE.
+- */
+-SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
+-		unsigned long, new_len, unsigned long, flags,
+-		unsigned long, new_addr)
++unsigned long mremap_ctx(unsigned long addr, unsigned long old_len,
++		unsigned long new_len, unsigned long flags,
++		unsigned long new_addr, struct task_struct *ctx)
+ {
+-	struct mm_struct *mm = current->mm;
++	struct mm_struct *mm = ctx->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long ret = -EINVAL;
+ 	unsigned long charged = 0;
+@@ -518,12 +519,12 @@ SYSCALL_DEFINE5(mremap, unsigned long, a
+ 	if (!new_len)
+ 		return ret;
+ 
+-	if (down_write_killable(&current->mm->mmap_sem))
++	if (down_write_killable(&ctx->mm->mmap_sem))
+ 		return -EINTR;
+ 
+ 	if (flags & MREMAP_FIXED) {
+-		ret = mremap_to(addr, old_len, new_addr, new_len,
+-				&locked);
++		ret = mremap_to_ctx(addr, old_len, new_addr, new_len,
++					&locked, ctx);
+ 		goto out;
+ 	}
+ 
+@@ -533,7 +534,7 @@ SYSCALL_DEFINE5(mremap, unsigned long, a
+ 	 * do_munmap does all the needed commit accounting
+ 	 */
+ 	if (old_len >= new_len) {
+-		ret = do_munmap(mm, addr+new_len, old_len - new_len);
++		ret = do_munmap_ctx(mm, addr+new_len, old_len - new_len, ctx);
+ 		if (ret && old_len != new_len)
+ 			goto out;
+ 		ret = addr;
+@@ -543,7 +544,7 @@ SYSCALL_DEFINE5(mremap, unsigned long, a
+ 	/*
+ 	 * Ok, we need to grow..
+ 	 */
+-	vma = vma_to_resize(addr, old_len, new_len, &charged);
++	vma = vma_to_resize_ctx(addr, old_len, new_len, &charged, ctx);
+ 	if (IS_ERR(vma)) {
+ 		ret = PTR_ERR(vma);
+ 		goto out;
+@@ -583,10 +584,10 @@ SYSCALL_DEFINE5(mremap, unsigned long, a
+ 		if (vma->vm_flags & VM_MAYSHARE)
+ 			map_flags |= MAP_SHARED;
+ 
+-		new_addr = get_unmapped_area(vma->vm_file, 0, new_len,
++		new_addr = get_unmapped_area_ctx(vma->vm_file, 0, new_len,
+ 					vma->vm_pgoff +
+ 					((addr - vma->vm_start) >> PAGE_SHIFT),
+-					map_flags);
++					map_flags, ctx);
+ 		if (offset_in_page(new_addr)) {
+ 			ret = new_addr;
+ 			goto out;
+@@ -599,8 +600,22 @@ out:
+ 		vm_unacct_memory(charged);
+ 		locked = 0;
+ 	}
+-	up_write(&current->mm->mmap_sem);
++	up_write(&ctx->mm->mmap_sem);
+ 	if (locked && new_len > old_len)
+-		mm_populate(new_addr + old_len, new_len - old_len);
++		mm_populate_ctx(new_addr + old_len, new_len - old_len, ctx);
+ 	return ret;
+ }
++
++/*
++ * Expand (or shrink) an existing mapping, potentially moving it at the
++ * same time (controlled by the MREMAP_MAYMOVE flag and available VM space)
++ *
++ * MREMAP_FIXED option added 5-Dec-1999 by Benjamin LaHaise
++ * This option implies MREMAP_MAYMOVE.
++ */
++SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
++		unsigned long, new_len, unsigned long, flags,
++		unsigned long, new_addr)
++{
++	return mremap_ctx(addr, old_len, new_len, flags, new_addr, current);
++}
+diff -uprN a/mm/util.c b/mm/util.c
+--- a/mm/util.c	2018-06-09 12:26:18.880493021 -0700
++++ b/mm/util.c	2018-06-10 11:32:34.000000000 -0700
+@@ -290,37 +290,55 @@ int __weak get_user_pages_fast(unsigned
+ }
+ EXPORT_SYMBOL_GPL(get_user_pages_fast);
+ 
+-unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
++unsigned long vm_mmap_pgoff_ctx(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+-	unsigned long flag, unsigned long pgoff)
++	unsigned long flag, unsigned long pgoff,
++	struct task_struct *ctx)
+ {
+-	unsigned long ret;
+-	struct mm_struct *mm = current->mm;
++	unsigned long ret = 0;
++	struct mm_struct *mm = ctx->mm;
+ 	unsigned long populate;
+ 
+ 	ret = security_mmap_file(file, prot, flag);
+ 	if (!ret) {
+ 		if (down_write_killable(&mm->mmap_sem))
+ 			return -EINTR;
+-		ret = do_mmap_pgoff(file, addr, len, prot, flag, pgoff,
+-				    &populate);
++		ret = do_mmap_pgoff_ctx(file, addr, len, prot, flag, pgoff,
++				    &populate, ctx);
+ 		up_write(&mm->mmap_sem);
+ 		if (populate)
+-			mm_populate(ret, populate);
++			mm_populate_ctx(ret, populate, ctx);
+ 	}
+ 	return ret;
+ }
+ 
+-unsigned long vm_mmap(struct file *file, unsigned long addr,
++unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+-	unsigned long flag, unsigned long offset)
++	unsigned long flag, unsigned long pgoff)
++{
++	return vm_mmap_pgoff_ctx(file, addr, len, prot, flag, pgoff, current);
++}
++
++unsigned long vm_mmap_ctx(struct file *file, unsigned long addr,
++	unsigned long len, unsigned long prot,
++	unsigned long flag, unsigned long offset,
++	struct task_struct *ctx)
+ {
+ 	if (unlikely(offset + PAGE_ALIGN(len) < offset))
+ 		return -EINVAL;
+ 	if (unlikely(offset_in_page(offset)))
+ 		return -EINVAL;
+ 
+-	return vm_mmap_pgoff(file, addr, len, prot, flag, offset >> PAGE_SHIFT);
++	return vm_mmap_pgoff_ctx(file, addr, len, prot, flag,
++		offset >> PAGE_SHIFT, ctx);
++}
++EXPORT_SYMBOL(vm_mmap_ctx);
++
++unsigned long vm_mmap(struct file *file, unsigned long addr,
++	unsigned long len, unsigned long prot,
++	unsigned long flag, unsigned long offset)
++{
++	return vm_mmap_ctx(file, addr, len, prot, flag, offset, current);
+ }
+ EXPORT_SYMBOL(vm_mmap);
+ 

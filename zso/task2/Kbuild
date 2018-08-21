@@ -1,0 +1,2 @@
+obj-m := harddoom.o
+harddoom-objs := buffers.o command.o common.o debug.o main.o surface.o

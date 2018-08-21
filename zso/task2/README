@@ -1,0 +1,127 @@
+Marek Sokołowski (ms360974) -- ZSO 17/18, zadanie 2
+=====================================================
+
+English: this implements a simple Linux driver for a graphics accelerator.
+It runs as a kernel module in Linux 4.9.13, and is able to run a modified
+open-source version of Doom.
+More information (incl. information on how to build the test environment):
+http://students.mimuw.edu.pl/ZSO/PUBLIC-SO/2017-2018/_build/html/z2_driver/index-en.html
+
+===
+
+Implementowana wersja: asynchroniczna, bez bloku wczytywania poleceń (max 9p)
+
+Każde urządzenie reprezentowane jest przeze mnie przez (całkiem sporą) strukturę
+harddoom_dev (common.h). Urządzenie tworzy swoją własną pulę stron DMA (każda
+rozmiaru 2KB, taka, jak rozmiar strony urządzenia), rejestruje własne
+przerwania, struktury synchronizacyjne oraz listę deskryptorów powiązanych z tym
+urządzeniem (utworzonych za pomocą jednego z ioctl-ów). Trzyma też całkiem
+pokaźny zbiór scache'owanych danych, ale o tym za chwilę.
+
+Każde otwarcie pliku ma swoje odwzorowanie w strukturze harddoom_inode_data
+(common.h). Zawiera on listę buforów utworzonych za pomocą tego deskryptora.
+(Dla zapewnienia ochrony, dostępy do tej listy są muteksowane.)
+Każdy deskryptor jest tworzony za pomocą funkcji anon_inode_getfile.
+
+Każdy bufor (stworzony ioctl-em na /dev/doomX) ma swoją implementację w
+strukturach doomdev_{surface,texture,flat,colormaps} (buffers.h), a każdy
+odpowiadający deskryptor - w harddoom_inode_data (common.h). W celu
+uproszczenia implementacji, pewna ilość wspólnych parametrów (jak na przykład
+zbiór stron przynależnych do bufora czy numer deskryptora) znajdują się we
+wspólnym ich nagłówku. Podczas tworzenia bufora, alokujemy odpowiednią ilość
+stron DMA i ewentualnie wypełniamy je danymi. W przypadku stronicowanych
+buforów, zapisujemy też tablicę stron na końcu bufora (pamiętając o wyrównaniu
+tablicy stron oraz o zapewnieniu odpowiednio dużego miejsca). Każdy bufor
+dla ułatwienia znajduje się na rozłącznym zestawie stron (można by próbować
+łączyć ze sobą colormapy, ale to jest słaby pomysł).
+
+Mamy więc taki "łańcuszek": harddoom_dev zawiera listę harddoom_inode_data, z
+których każde zawiera listę obiektów doomdev_*. Pozwoli to później na łatwiejsze
+sprzątanie po sobie.
+
+Podczas pojedynczego ioctl-a na buforze: pobieramy wskaźniki do ewentualnych
+pomocniczych buforów na podstawie deskryptorów (fdget, fdput), sprawdzamy
+wstępnie poprawność danych (czy bufor jest poprawnego typu, czy polecenia nie
+są widocznie błędne). Jeśli jest OK, to pobieramy muteksa na całe urządzenie,
+ustawiamy odpowiednie tablice stron, wskaźniki i parametry i uruchamiamy
+nakazane operacje na urządzeniu. (Dla ułatwienia, wykorzystuję pomocnicze
+funkcje w command.h.). Po wykonaniu roboty lub znalezieniu błędu oddajemy
+muteksa i zwracamy odpowiedni wynik.
+
+W dalszej części opisu istotne jest, że zawsze dążymy do dopuszczania przerwań,
+kiedy musimy czekać na urządzenie - kiedy ktoś wyjmie nam DoomDeva, nie chcemy
+beznadziejnie zawiesić całego procesu korzystającego z niego...
+
+Głównym koniem napędowym procesu wydawania poleceń jest funkcja
+doomcmd_put_command (command.c). Wydaje ona polecenia przez rejestr FIFO_SEND.
+Co 128 poleceń wrzuca ona do kolejki polecenie PING_ASYNC w celu monitorowania
+kolejki. W przypadku, gdy nie ma miejsca w kolejce, postępujemy jak polecono:
+czyścimy przerwania na urządzeniu, sprawdzamy, czy wciąż nie ma miejsca,
+włączamy przerwanie ASYNC, oczekujemy na przerwanie na linii PCI
+(doomcmd_interrupts_await) i wyłączamy przerwanie.
+
+Co do przerwań - struktura opisująca urządzenie zawiera maskę nieprzetworzonych
+jeszcze przerwań. Każde przerwanie sprzętowe uaktualnia (atomowo) maskę
+i ewentualnie budzi wątek oczekujący na jakieś przerwania. Czekający wątek
+natomiast atomowo sprawdza, czy "jego" przerwanie już pojawiło się na masce
+przerwań.
+
+Synchronizacji urządzenia postanowiłem nie robić za pomocą PING_SYNC -
+podczas klepania nie widziałem prostego sposobu dokonania tego bez konieczności
+uninterruptible wait. (Jeśli dokonujemy tylko interruptible wait, możemy zostać
+"zrzuceni z rowerka" podczas oczekiwania. Gdy jeszcze raz spróbujemy się
+zsynchronizować, być może w losowym momencie "oberwiemy" starym przerwaniem.
+Teraz widzę, że można w tej sytuacji *poczekać* na INTR_SYNC, zanim jeszcze raz
+wrzucimy komendę PING_SYNC do kolejki.) W każdym razie, zaimplementowałem
+ją za pomocą komendy FENCE (zgodnie z instrukcją). W tej sytuacji, doskonale
+wiemy, na którą wartość rejestru FENCE_LAST oczekujemy (na tę wrzuconą ostatnio)
+i to istotnie upraszcza rozmyślania i implementację. Ponieważ bufor poleceń
+ma tylko 512 miejsc, a urządzenie może spamiętać maksymalnie 2048 ostatnich
+FENCE'ów (i 512 + 2048 << 2 ** 26), bardzo łatwo sprawdzić, kiedy FENCE_LAST
+przekroczy FENCE_WAIT.
+
+Struktura urządzenia (w podstrukturze harddoom_dev_writer, common.h) dodatkowo
+utrzymuje cache bardzo przydatny przy optymalizacji urządzenia. Utrzymywane
+są adresy podane w ostatnio wydanych poleceniach SURF_DST_PT, SURF_SRC_PT,
+TEXTURE_PT, FLAT_ADDR, COLORMAP_ADDR, TRANSLATION_ADDR, oraz ostatnio wydane
+komendy SURF_DIMS i TEXTURE_DIMS. W sytuacji, w której mamy wydać jedno z tych
+poleceń, sprawdzamy w cache'u, czy na pewno musimy podmieniać adresy. Jeśli
+nie, odpowiednia funkcja w command.c po prostu nic nie robi.
+
+Dodatkową optymalizacją jest flaga is_synchronized. Jeśli od momentu
+synchronizacji (czyli: opróżnienia całego bufora poleceń) na kolejkę poleceń nie
+wrzuciliśmy żadnego polecenia, nie musimy się jeszcze raz synchronizować.
+Pozwala nam to zaoszczędzić trochę cykli procesora (przetworzenie przerwania!).
+
+Ponadto, ciekawą operacją jest INTERLOCK. Każdy surface utrzymuje flagę
+informującą, czy kopiowanie z tego surface'a jest bezpieczne. Ponadto,
+urządzenie utrzymuje listę tych surface'ów, z których kopiowanie nie jest
+bezpieczne. Pozwala nam to wydawać polecenia INTERLOCK optymalnie - zachłannie
+za każdym razem najpóźniej, jak to tylko możliwe. Przy wydaniu INTERLOCK-a
+naprawiamy flagę "bezpieczeństwa" wszystkim niebezpiecznym surface'om.
+
+Asynchroniczna natura urządzenia rodzi jednak spore problemy: zwalnianie
+pamięci DMA. Teoretycznie powinniśmy zwolnić pamięć w momencie, gdy zamykamy
+uchwyt do /dev/doomX (użytkownik traci wtedy jakikolwiek dostęp do deskryptorów
+stworzonych w ten sposób). Jednak nie jest to do końca możliwe: w kolejce
+poleceń wciąż mogą znajdować się polecenia działające na tych buforach.
+Zwolnienie ich natychmiast prowadziłoby do page fault.
+Jakimś pomysłem byłaby synchronizacja, ale niestety nas na to nie stać -
+ktoś mógłby ponownie "zrzucić" nas "z rowerka" podczas oczekiwania na
+przerwanie; w tej sytuacji nie bardzo mielibyśmy co zrobić (powiedzieć, że
+wystąpił błąd - nie, bo wycieknie nam pamięć; zwolnić "na chama" pamięć - nie,
+bo dostaniemy page fault; czekać uninterruptible - też nie bardzo, bo wisimy na
+urządzeniu).
+
+Postanowiłem więc rozwiązać to w następujący sposób: podczas prośby o dealokację
+bufora, niszczymy odwołania do niego (harddoom_release_buffer, buffers.c);
+w naszym przypadku, wystarczy zwolnić deskryptor bufora i ewentualnie pozycję
+na liście "niebezpiecznych" surface'ów (por. INTERLOCK). Natomiast samo
+zwolnienie pamięci DMA odwlekamy - albo do momentu następnej synchronizacji
+z urządzeniem (wtedy mamy pewność, że wszystko się przetworzyło), albo
+pełnego wyłączenia urządzenia (wtedy i tak już nic nie zrobimy).
+
+DOOM działa pod QEMU (nawet dwie równoległe instancje chodzą poprawnie), jednak
+działa on dosyć wolno (u mnie w porywach do 7-8 fps). Być może jest to kwestią
+braku implementacji bloku wczytywania poleceń.
+

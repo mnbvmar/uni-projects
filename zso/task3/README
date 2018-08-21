@@ -1,0 +1,52 @@
+Marek Sokolowski (ms360974)
+Zadanie 3 z ZSO 
+=================================
+
+English: this is a patch to Linux 4.9.13 kernel extending the functionality
+of the [ptrace] system call. It allows to control the file descriptors in the
+traced process, including mapping files/memory as descriptors in the tracee,
+copying descriptors between the tracer and the tracee etc.
+More information (Polish only):
+http://students.mimuw.edu.pl/ZSO/PUBLIC-SO/2017-2018/_build/html/z3_kernel/index.html
+
+===
+
+Opcje do `ptrace` implementuję dosyć normalnie, tj. w kernel/ptrace.c, funkcji
+ptrace_request. Wewnątrz czytam dane użytkownika (zwracając -EFAULT w przypadku
+błędu), wstępnie waliduję ich poprawność, a następnie uruchamiam odpowiednią
+implementację Linuksowego syscalla. Wszystkie ptrace'y wykonuję w kontekście
+tracera.
+
+Ponieważ wiele z operacji musi być wykonywanych na procesie tracee, tworzę
+"rozserzone" wersje wielu potrzebnych mi funkcji jądra, dodatkowo pobierających
+informację o procesie, na którym operacja ma zostać wykonana. (Prawie) każda
+taka funkcja ma postać kernel_func_ctx(<original args>, struct task_struct *ctx)
+dla oryginalnej funkcji kernel_func. W celu zachowania kompatybilności z
+istniejącym kodem, oryginalna funkcja zostaje podmieniona na prosty call
+do rozszerzonej funkcji podstawiający ctx=current.
+
+Kilka zauważeń:
+* glibc podczas wywołania funkcji bibliotecznej mmap() samodzielnie przelicza
+    offset w bajtach na offset w stronach, a dopiero potem wykonuje syscall
+    mmap_pgoff. Tak więc my robimy analogicznie - przeliczamy ten offset
+    (plując -EINVAL, gdy offset nie jest wielokrotnością strony), a potem wołamy
+    mmap_pgoff_ctx.
+
+* podczas mapowania deskryptorów sprawdzane są uprawnienia procesu do
+    deskryptora (łańcuch wywołań: mmap_pgoff, vm_mmap_pgoff, security_mmap_file,
+    który ostatecznie wywołuje listę callbacków sprawdzających poprawność
+    mmapa). Ponieważ uprawnienia tracera i tracee mogą być różne (tracera mogą
+    być większe), podjąłem decyzję, że weryfikowane są uprawnienia tracera.
+    Ma to sens - w końcu jeśli tracer ma dostęp do pliku (czy to read, czy to
+    write), ma wielorakie - choć raczej nienatychmiastowe - możliwości
+    udostępnienia tego pliku tracee.
+    Upraszcza to nieco implementację: funkcje sprawdzające bezpieczeństwo
+    mogą bezpiecznie wykorzystywać kontekst tracera (current).
+
+* nieco trudniejszą operacją jest dup2 ze względu na konieczność wzięcia dwóch
+    spinlocków odpowiadających tablicom deskryptorów. Istotne jest (w przypadku,
+    gdy wykonujemy DUP2_TO_REMOTE), by zwiększyć licznik odwołań do
+    przekazywanego pliku jeszcze przed zwolnieniem spinlocka do tablicy
+    źródłowej. W przeciwnym razie, ktoś mógłby nam "zniknąć" plik, zanim jeszcze
+    podmontujemy go pod tracee.
+

@@ -1,0 +1,32 @@
+Program zaliczeniowy 1 z ZSO
+Marek Sokolowski (360974)
+==============================
+
+English: this program emulates 64-bit ELF executables that use a modified set of
+x86 syscalls. To run a sample program, run [make] and then [./emu ./prog 150].
+Use arrow keys, [Enter] and [Space] to interact with the program.
+Task statement:
+http://students.mimuw.edu.pl/ZSO/PUBLIC-SO/2017-2018/_build/html/z1_elf/index-en.html
+
+===
+
+Moje rozwiazanie korzysta z funkcji `ptrace` z poleceniem PTRACE_SYSEMU
+w celu emulacji wywolan systemowych podejmowanych przez tracee.
+
+Dziecko jest uruchamiane poprzez wywolanie systemowe `exec`. Wymaga to dodatkowych
+sprawdzen poprawnosci pliku ELF (w szczegolnosci musimy sprawdzic, czy uruchamiamy
+plik ELF w architekturze x86-64 oraz czy plik nie definiuje linkera dynamicznego).
+W praktyce robie to, odpowiednio sprawdzajac naglowki oraz zezwalajac jedynie
+na sekcje PT_NONE, PT_DATA oraz PT_PARAMS w naglowkach programu.
+Tuz po uruchomieniu programu, kiedy po wywolaniu systemowym `exec` oddaje on
+kontrole emulatorowi, wstawiamy w odpowiednie miejsce pamieci argumenty linii komend.
+Wczesniej upewniamy sie, czy odpowiedni obszar pamieci jest zmapowany, wiec
+taki zapis jest mozliwy.
+
+Aby wykonywac operacje na terminalu, korzystam z biblioteki curses.
+Nieco przyjemniejszy w obsludze wrapper funkcji bibliotecznych znajduje sie w plikach
+terminal.{h,c}.
+
+Do kompilacji na Debianie potrzeba pakietow `libncursesw5 libncursesw5-dev`.
+Sam proces kompilacji jest prosty - po rozpakowaniu nalezy w katalogu glownym
+uruchomic polecenie `main`.
